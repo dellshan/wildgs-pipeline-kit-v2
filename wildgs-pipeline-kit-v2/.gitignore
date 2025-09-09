@@ -1,0 +1,68 @@
+# Large files and archives
+*.tgz
+*.zip
+*.tar.gz
+*.pkl
+*.pt
+*.pth
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Image files (large ones)
+*.png
+*.jpg
+*.jpeg
+
+# Large datasets and models
+models/
+pretrained_models/
+runs/
+output/
+
+# Generated visualizations
+vis_seq_*/
+masks_*/
+
+# Temporary files
+tmp*
+
+# Data files
+*.csv
+keyframes/
+keyframes.zip
+
+# Package files
+*_pack.*
+
+# System files
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
+
+# Git submodules (embedded repositories)
+deps/WildGS-SLAM/
+deps/_sam2_src.off/
+deps/sam2_official/
+yolov12/

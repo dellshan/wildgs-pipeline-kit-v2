@@ -1,0 +1,35 @@
+# 物体类：可增删
+objects:
+  - table
+  - chair
+  - laptop
+  - monitor
+  - keyboard
+  - mouse
+  - bottle
+  - cup
+  - book
+  - backpack
+  - cable
+  - camera
+  - tripod
+
+# 场景/材质类
+regions:
+  - wall
+  - floor
+  - window
+  - door
+  - whiteboard
+  - shelf
+  - screen
+
+# 组合类（用于描述“桌子上的杂物”等）
+composites:
+  # clutter 不是直接分割的类别，而是这些“小件”的并集
+  clutter_children:
+    - bottle
+    - cup
+    - book
+    - cable
+    - backpack

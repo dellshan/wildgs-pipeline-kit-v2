@@ -1,0 +1,8 @@
+open-clip-torch>=2.24.0
+diffusers>=0.27.0
+accelerate>=0.30.0
+imageio
+imageio-ffmpeg
+pillow
+numpy
+pandas

@@ -1,0 +1,6 @@
+{
+  "frames_csv": "frames_views.csv",
+  "objects_csv": "objects_views.csv",
+  "default_view_id": 1,
+  "masks_dir": "masks_view1"
+}
