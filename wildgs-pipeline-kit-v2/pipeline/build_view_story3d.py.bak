@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Build a manual (or auto) view story with optional 3D annotations:
+- Inputs: frames + masks CSV (+ optional semantics, + optional poses)
+- View selection: manual list (one filename per line) or top-N by coverage
+- Transitions: if poses provided, produce "Move X m, turn +/-Y°"
+- Per-frame summary: salient objects (area & centrality), obstacle analysis
+- 3D marking (optional):
+    * Either depth maps + intrinsics + poses
+    * Or floor-plane intersection + intrinsics + poses
+- Outputs:
+    out_dir/ann/*_annot.png        : annotated frames
+    out_dir/storyboard_annot.png   : storyboard
+    out_dir/story.json             : machine-readable story
+    out_dir/story.md               : narration-ready markdown
+    out_dir/prompts/summary_prompt.md
+    out_dir/prompts/obstacle_prompt.md
+"""
+
+import os, sys, json, math, argparse, warnings
+import os.path as op
+from collections import defaultdict, Counter
+
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+import cv2
+from tqdm import tqdm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# --------------------------- small utils ---------------------------
+
+def ensure_dir(d): os.makedirs(d, exist_ok=True)
+
+def imread_gray(fp): return np.array(Image.open(fp).convert("L"))
+
+def load_df_masks(csv_path):
+    df = pd.read_csv(csv_path)
+    for c in ["image","mask"]:
+        if c not in df.columns:
+            raise RuntimeError(f"CSV missing column: {c}")
+    df["image"] = df["image"].astype(str)
+    df["mask"]  = df["mask"].astype(str)
+    if "conf" in df.columns:
+        df["conf"] = df["conf"].astype(float)
+    return df
+
+def resolve_mask(mask_root, m):
+    m = str(m)
+    if op.isabs(m) and op.isfile(m): return m
+    b = op.basename(m)
+    p1 = op.join(mask_root, b)
+    if op.isfile(p1): return p1
+    p2 = op.join(mask_root, m)
+    if op.isfile(p2): return p2
+    return None
+
+
+# --------------------------- semantics ---------------------------
+
+def load_semantics(path):
+    if not path or not op.isfile(path): return {}
+    ext = op.splitext(path)[1].lower()
+    out = {}
+    try:
+        if ext == ".json":
+            data = json.load(open(path, "r"))
+            if isinstance(data, dict):
+                for k,v in data.items(): out[op.basename(k)] = str(v)
+            elif isinstance(data, list):
+                for it in data:
+                    if isinstance(it, dict):
+                        mk = op.basename(str(it.get("mask","")))
+                        lab = it.get("label", it.get("text",""))
+                        if mk and lab: out[mk] = str(lab)
+        elif ext == ".csv":
+            df = pd.read_csv(path)
+            mcol = "mask" if "mask" in df.columns else None
+            lcol = "label" if "label" in df.columns else ("text" if "text" in df.columns else None)
+            if mcol and lcol:
+                for _,r in df.iterrows():
+                    out[op.basename(str(r[mcol]))] = str(r[lcol])
+    except Exception as e:
+        warnings.warn(f"[semantics] parse failed: {e}")
+    return out
+
+
+# --------------------------- poses & intrinsics ---------------------------
+
+def load_poses_json(path):
+    if not path or not op.isfile(path): return {}
+    data = json.load(open(path,"r"))
+    poses = {}
+    def as44(a): return np.array(a, float).reshape(4,4)
+    try:
+        if isinstance(data, dict) and "poses" in data:
+            for it in data["poses"]:
+                name = op.basename(str(it.get("image",""))); T = it.get("T") or it.get("T_wc") or it.get("pose")
+                if name and T is not None: poses[name]=as44(T)
+        elif isinstance(data, list):
+            for it in data:
+                if isinstance(it, dict):
+                    name = op.basename(str(it.get("image",""))); T = it.get("T") or it.get("T_wc") or it.get("pose")
+                    if name and T is not None: poses[name]=as44(T)
+        elif isinstance(data, dict):
+            for k,v in data.items():
+                if isinstance(v,(list,tuple)) and len(v)==16: poses[op.basename(k)]=as44(v)
+    except Exception as e:
+        warnings.warn(f"[poses] parse failed: {e}")
+    return poses
+
+def load_intrinsics(args, sample_im_path=None):
+    """Returns dict with fx, fy, cx, cy.
+       Priority:
+         1) --intrinsics_json
+         2) --fx/--fy/--cx/--cy
+         3) --fov_deg (+ image W/H) -> fx=fy=0.5*W/tan(fov/2)
+         4) None (return None)
+    """
+    if args.intrinsics_json and op.isfile(args.intrinsics_json):
+        J = json.load(open(args.intrinsics_json,"r"))
+        if all(k in J for k in ["fx","fy","cx","cy"]): return {k:float(J[k]) for k in ["fx","fy","cx","cy"]}
+    if args.fx and args.fy and args.cx and args.cy:
+        return dict(fx=float(args.fx), fy=float(args.fy), cx=float(args.cx), cy=float(args.cy))
+    if args.fov_deg is not None and sample_im_path and op.isfile(sample_im_path):
+        im = Image.open(sample_im_path).convert("RGB")
+        W,H = im.size
+        f = 0.5*W/math.tan(math.radians(args.fov_deg)/2)
+        return dict(fx=f, fy=f, cx=W/2, cy=H/2)
+    return None
+
+
+# --------------------------- transitions ---------------------------
+
+def pose_delta(Ta, Tb):
+    try:
+        Trel = np.linalg.inv(Ta) @ Tb
+        t = Trel[:3,3]; trans = float(np.linalg.norm(t))
+        R = Trel[:3,:3]; yaw = float(math.degrees(math.atan2(R[1,0], R[0,0])))
+        return trans, yaw
+    except Exception:
+        return None, None
+
+def transition_text(a_name, b_name, poses):
+    if a_name in poses and b_name in poses:
+        d, yaw = pose_delta(poses[a_name], poses[b_name])
+        if d is not None:
+            dir_txt = ""
+            if yaw is not None:
+                if yaw > 8: dir_txt = f", then turn right {abs(yaw):.0f}°"
+                elif yaw < -8: dir_txt = f", then turn left {abs(yaw):.0f}°"
+            return f"Move forward {d:.1f} m{dir_txt}."
+    return "Proceed to the next viewpoint."
+
+
+# --------------------------- coverage & selection ---------------------------
+
+def load_union_mask(paths, size_hw):
+    H,W = size_hw
+    u = np.zeros((H,W), np.uint8)
+    for mp in paths:
+        try:
+            m = np.array(Image.open(mp).convert("L"))
+            if m.shape[:2]!=(H,W):
+                m = cv2.resize(m,(W,H),interpolation=cv2.INTER_NEAREST)
+            u = np.maximum(u,m)
+        except Exception:
+            pass
+    return u
+
+def coverage_for(frames_dir, images, img2masks):
+    cov={}
+    for fn in tqdm(images, desc="coverage", ncols=80):
+        fp = op.join(frames_dir, fn)
+        if not op.isfile(fp): cov[fn]=0.0; continue
+        im = Image.open(fp).convert("RGB"); W,H=im.size
+        ms = img2masks.get(fn,[])
+        if not ms: cov[fn]=0.0; continue
+        u = load_union_mask(ms, (H,W))
+        cov[fn] = float((u>0).mean())
+    return cov
+
+def pick_views(selected_file, images_sorted, cov, topn):
+    if selected_file and op.isfile(selected_file):
+        sel = [ln.strip() for ln in open(selected_file,"r").read().splitlines() if ln.strip()]
+        sel = [s for s in sel if s in images_sorted]
+        if sel: return sel
+    if not cov: return images_sorted[:topn]
+    return sorted(images_sorted, key=lambda x: cov.get(x,0.0), reverse=True)[:topn]
+
+
+# --------------------------- hazard heuristics ---------------------------
+
+RISK_COLORS = {
+    "near_center": (255,128,0),
+    "near_bottom": (255,0,0),
+    "large":       (255,0,255),
+    "default":     (0,200,255),
+}
+
+HAZARD_CLASSES = {
+    "chair":"obstacle","sofa":"obstacle","couch":"obstacle","table":"obstacle","stool":"obstacle","cabinet":"obstacle",
+    "door":"passage","doorway":"passage",
+    "stairs":"fall","stair":"fall","ladder":"fall",
+    "toy":"child_risk","bottle":"child_risk","glass":"child_risk",
+    "wire":"trip","cable":"trip","rug":"trip","carpet":"trip","threshold":"trip",
+    "person":"dynamic",
+}
+def label_to_hazard(lbl):
+    if not lbl: return None
+    s = lbl.lower()
+    for k,v in HAZARD_CLASSES.items():
+        if k in s: return v
+    return None
+
+def mask_stats(mask_fp, W, H):
+    m = np.array(Image.open(mask_fp).convert("L"))
+    if m.shape[:2]!=(H,W):
+        m = cv2.resize(m,(W,H),interpolation=cv2.INTER_NEAREST)
+    b = (m>0).astype(np.uint8)
+    area = int(b.sum())
+    if area==0: return dict(area=0,bbox=(0,0,0,0),centroid=(W//2,H//2),frac=0.0)
+    ys,xs = np.where(b>0)
+    y0,y1 = ys.min(), ys.max(); x0,x1 = xs.min(), xs.max()
+    cx,cy = int(xs.mean()), int(ys.mean())
+    frac = float(area)/(W*H)
+    return dict(area=area,bbox=(x0,y0,x1,y1),centroid=(cx,cy),frac=frac)
+
+def saliency(stat, W, H):
+    cx,cy = stat["centroid"]; dx=(cx-W/2)/(W/2); dy=(cy-H/2)/(H/2)
+    dist = math.sqrt(dx*dx+dy*dy)
+    return stat["frac"]*(1.5 - dist)
+
+def risk_tags(stat, W, H, label=None):
+    tags=[]
+    if stat["centroid"][1] > H*0.70: tags.append("near_bottom")
+    if abs(stat["centroid"][0]-W/2) < W*0.12: tags.append("near_center")
+    if stat["frac"]>=0.12: tags.append("large")
+    haz = label_to_hazard(label)
+    if haz: tags.append(haz)
+    severity = min(3,len(tags))
+    return tags, severity
+
+
+# --------------------------- 3D utils ---------------------------
+
+def load_depth(depth_dir, name):
+    """Return depth map in meters if present; support common encodings:
+       - 16bit PNG in millimeters (set --depth_scale=0.001)
+       - 16bit PNG already in meters (scale=1)
+       - 8bit normalized with --depth_max
+    """
+    if not depth_dir: return None, None
+    stem = op.splitext(name)[0]
+    for suf in ["_depth.png","_depth16.png","_d.png","_depth.tiff","_depth.tif","_depth.exr"]:
+        fp = op.join(depth_dir, stem + suf)
+        if op.isfile(fp):
+            dm = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+            return dm, fp
+    # also try exact name
+    fp = op.join(depth_dir, name)
+    if op.isfile(fp):
+        dm = cv2.imread(fp, cv2.IMREAD_UNCHANGED)
+        return dm, fp
+    return None, None
+
+def depth_to_meters(raw, scale=1.0, dmax=None):
+    if raw is None: return None
+    if raw.dtype==np.uint16:
+        d = raw.astype(np.float32)*float(scale)
+    elif raw.dtype==np.float32 or raw.dtype==np.float16:
+        d = raw.astype(np.float32)*float(scale)
+    else: # 8-bit
+        if dmax is None: return None
+        d = raw.astype(np.float32)/255.0 * float(dmax)
+    return d
+
+def K_from_dict(Kd): 
+    fx,fy,cx,cy = Kd["fx"],Kd["fy"],Kd["cx"],Kd["cy"]
+    K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1.0]], float)
+    return K
+
+def ray_dir_cam(u,v,K):
+    fx,fy,cx,cy = K[0,0],K[1,1],K[0,2],K[1,2]
+    x = (u-cx)/fx; y=(v-cy)/fy
+    d = np.array([x,y,1.0], float)
+    d = d/np.linalg.norm(d)
+    return d
+
+def cam_to_world_dir(d_cam, T_wc):
+    R = T_wc[:3,:3]
+    return (R @ d_cam.reshape(3,1)).ravel()
+
+def cam_center_world(T_wc):
+    return T_wc[:3,3].ravel()
+
+def plane_intersect(C, d, n, d0):
+    # plane: n·X + d0 = 0 ; ray: C + t d
+    denom = float(np.dot(n,d))
+    if abs(denom) < 1e-6: return None
+    t = -(np.dot(n,C)+d0)/denom
+    if t<=0: return None
+    X = C + t*d
+    return X
+
+def world_to_cam(Xw, T_wc):
+    Twc = T_wc
+    R = Twc[:3,:3]; t = Twc[:3,3]
+    # Xc = R^T (Xw - t)  (since T_wc maps cam->world)
+    Xc = (R.T @ (Xw - t).reshape(3,1)).ravel()
+    return Xc
+
+def project_point(Xc, K):
+    if Xc[2] <= 1e-6: return None
+    uv = (K @ (Xc.reshape(3,1))).ravel()
+    return float(uv[0]/Xc[2]), float(uv[1]/Xc[2])
+
+
+# --------------------------- drawing ---------------------------
+
+def draw_box(draw, bbox, color, width=3):
+    x0,y0,x1,y1 = bbox
+    for k in range(width):
+        draw.rectangle([x0-k,y0-k,x1+k,y1+k], outline=color)
+
+def annotate_frame(frame_fp, out_fp, objs, add_3d=False):
+    im = Image.open(frame_fp).convert("RGB")
+    W,H = im.size
+    draw = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans.ttf", 16)
+    except Exception:
+        font = None
+
+    for o in objs:
+        color = RISK_COLORS.get((o["risk_tags"][0] if o["risk_tags"] else "default"), RISK_COLORS["default"])
+        draw_box(draw, o["bbox"], color, width=3)
+        label = o.get("label") or "object"
+        sev = o.get("severity",0)
+        txt = f"{label} (s{sev})"
+        # 3D tag
+        if add_3d and o.get("Xw") is not None:
+            Xw = o["Xw"]; txt += f" 3D({Xw[0]:.2f},{Xw[1]:.2f},{Xw[2]:.2f})"
+        x0,y0,x1,y1 = o["bbox"]
+        tw = 8*len(txt)+8
+        draw.rectangle([x0, y0-18, x0+tw, y0], fill=(0,0,0,160))
+        draw.text((x0+4, y0-17), txt, fill=(255,255,255), font=font)
+
+    im.save(out_fp)
+
+
+# --------------------------- main ---------------------------
+
+def main(args):
+    frames_dir = args.frames
+    masks_csv  = args.masks_csv
+    out_dir    = args.out_dir
+    ensure_dir(out_dir)
+    ann_dir = op.join(out_dir, "ann"); ensure_dir(ann_dir)
+    prm_dir = op.join(out_dir, "prompts"); ensure_dir(prm_dir)
+
+    # data
+    df = load_df_masks(masks_csv)
+    if args.conf_thres is not None and "conf" in df.columns:
+        df = df[df["conf"] >= float(args.conf_thres)].reset_index(drop=True)
+
+    images_sorted = sorted(df["image"].unique().tolist())
+
+    # img -> mask files (resolved)
+    img2masks = defaultdict(list)
+    for _,r in df.iterrows():
+        mp = resolve_mask(args.mask_root, r["mask"])
+        if mp: img2masks[r["image"]].append(mp)
+
+    # semantics & poses
+    mask2label = load_semantics(args.semantics)
+    poses = load_poses_json(args.poses)
+
+    # coverage & selection
+    cov = coverage_for(frames_dir, images_sorted, img2masks)
+    chosen = pick_views(args.selected, images_sorted, cov, args.topn)
+    if not chosen:
+        print("[E] No views selected.", file=sys.stderr); sys.exit(1)
+
+    # intrinsics (for 3D)
+    sample_im_path = op.join(frames_dir, chosen[0])
+    Kd = load_intrinsics(args, sample_im_path)
+    K = K_from_dict(Kd) if Kd else None
+
+    # 3D config
+    do3d = args.enable_3d and (poses and K is not None) and (args.depth_dir or args.floor_axis is not None)
+    n = None; d0 = None
+    if do3d and args.floor_axis is not None:
+        axis = args.floor_axis.lower()
+        if axis=="z":
+            n = np.array([0,0,1.0], float); d0 = float(args.floor_offset)
+        elif axis=="y":
+            n = np.array([0,1.0,0], float); d0 = float(args.floor_offset)
+        elif axis=="x":
+            n = np.array([1.0,0,0], float); d0 = float(args.floor_offset)
+        else:
+            n=None; d0=None
+
+    story = []
+    all_summaries = []
+
+    for i,fn in enumerate(tqdm(chosen, desc="annotate", ncols=80)):
+        fpath = op.join(frames_dir, fn)
+        if not op.isfile(fpath): continue
+        im = Image.open(fpath).convert("RGB"); W,H = im.size
+        objs = []
+
+        # Prepare 3D helpers
+        T_wc = poses.get(fn, None)
+        depth_m = None
+        if do3d and args.depth_dir:
+            raw, _ = load_depth(args.depth_dir, fn)
+            depth_m = depth_to_meters(raw, scale=args.depth_scale, dmax=args.depth_max)
+
+        # per-instance stats
+        for mp in img2masks.get(fn, [])[:args.max_objs_each]:
+            st = mask_stats(mp, W, H)
+            if st["area"]<=0: continue
+            label = mask2label.get(op.basename(mp), None)
+            tags, sev = risk_tags(st, W, H, label)
+            rec = {
+                "mask": mp, "label": label, "bbox": st["bbox"], "centroid": st["centroid"],
+                "frac": st["frac"], "risk_tags": tags, "severity": sev,
+                "saliency": saliency(st, W, H), "Xw": None
+            }
+
+            # 3D estimate
+            if do3d and T_wc is not None and K is not None:
+                u,v = st["centroid"]
+                if depth_m is not None:  # unproject with depth
+                    z = float(depth_m[min(H-1,max(0,v)), min(W-1,max(0,u))])
+                    if z>0:
+                        # Xc=(x*z, y*z, z)
+                        d_cam = ray_dir_cam(u, v, K)
+                        Xc = d_cam * z
+                        # Xw = R Xc + t
+                        R = T_wc[:3,:3]; t = T_wc[:3,3]
+                        Xw = (R @ Xc.reshape(3,1)).ravel() + t
+                        rec["Xw"] = Xw
+                elif n is not None and d0 is not None:
+                    # floor plane intersection
+                    d_cam = ray_dir_cam(u,v,K)
+                    d_w = cam_to_world_dir(d_cam, T_wc)
+                    C = cam_center_world(T_wc)
+                    Xw = plane_intersect(C, d_w, n, d0)
+                    rec["Xw"] = Xw
+
+            objs.append(rec)
+
+        # keep top-k salient (and by severity)
+        objs.sort(key=lambda o: (o["severity"], o["saliency"]), reverse=True)
+        keep = objs[:args.max_objs_total]
+
+        # annotate
+        out_fp = op.join(ann_dir, op.splitext(op.basename(fn))[0] + "_annot.png")
+        annotate_frame(fpath, out_fp, keep, add_3d=do3d)
+
+        # textual bits
+        lbls = [o["label"] for o in keep if o.get("label")]
+        cnt = Counter(lbls)
+        salient = ", ".join([f"{k}×{v}" if v>1 else k for k,v in cnt.most_common(6)]) if cnt else "objects"
+        obs_txt = []
+        for o in keep[:8]:
+            l = o.get("label") or "object"
+            if o["risk_tags"]:
+                obs_txt.append(f"{l} ({'/'.join(o['risk_tags'])})")
+        obs_txt = ", ".join(obs_txt) if obs_txt else "none near the centerline"
+
+        trans = "End of route." if i==len(chosen)-1 else transition_text(fn, chosen[i+1], poses)
+
+        story.append({
+            "image": fn, "annot": op.relpath(out_fp, out_dir),
+            "coverage": cov.get(fn,0.0),
+            "salient": salient, "obstacles": obs_txt,
+            "transition_to_next": trans,
+            "objects": [
+                {
+                    "label": o.get("label"),
+                    "bbox": o["bbox"],
+                    "centroid": o["centroid"],
+                    "frac": o["frac"],
+                    "risk_tags": o["risk_tags"],
+                    "severity": o["severity"],
+                    "Xw": (o["Xw"].tolist() if isinstance(o.get("Xw"), np.ndarray) else (o["Xw"] if o.get("Xw") is None else list(o["Xw"])))
+                } for o in keep
+            ]
+        })
+
+        all_summaries.append(f"- **{fn}** | cov={cov.get(fn,0.0):.3f} | salient: {salient} | obstacles: {obs_txt} | transition: {trans}")
+
+    # outputs
+    with open(op.join(out_dir, "story.json"), "w", encoding="utf-8") as f:
+        json.dump({"frames": story}, f, ensure_ascii=False, indent=2, default=_npjson)
+
+    with open(op.join(out_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write("# Route Narrative\n\n")
+        for k,fr in enumerate(story,1):
+            f.write(f"## View {k}: {fr['image']}\n")
+            f.write(f"- Coverage: {fr['coverage']:.3f}\n")
+            f.write(f"- Salient: {fr['salient']}\n")
+            f.write(f"- Obstacles: {fr['obstacles']}\n")
+            f.write(f"- Transition: {fr['transition_to_next']}\n")
+            f.write(f"- Annotated: {fr['annot']}\n\n")
+
+    # prompts for LLM
+    with open(op.join(prm_dir, "summary_prompt.md"), "w", encoding="utf-8") as f:
+        f.write("You are a navigation-oriented scene summarizer.\n")
+        f.write("Summarize the scene concisely, covering main structures and objects that influence navigation.\n")
+        f.write("Use the frame-wise bullets below (salient objects, obstacles, transitions) but avoid redundancy.\n\n")
+        f.write("\n".join(all_summaries))
+
+    with open(op.join(prm_dir, "obstacle_prompt.md"), "w", encoding="utf-8") as f:
+        f.write("You are a safety analyst for indoor navigation.\n")
+        f.write("Based on the per-view bullets, list potential obstacles for human passage, grouped by type:\n")
+        f.write("  - child hazards (sharp edges, small objects, glass)\n")
+        f.write("  - elderly fall risks (stairs, rugs, thresholds, cables)\n")
+        f.write("  - centerline/blockers (large furniture close to ground)\n")
+        f.write("Be short and actionable.\n\n")
+        f.write("\n".join(all_summaries))
+
+    # storyboard
+    def paste_grid(img_list, cols=4):
+        if not img_list: return
+        p0 = op.join(out_dir, img_list[0]["annot"])
+        im0 = Image.open(p0).convert("RGB")
+        W,H = im0.size
+        rows = math.ceil(len(img_list)/cols)
+        canvas = Image.new("RGB", (cols*W, rows*H), (255,255,255))
+        for i,fr in enumerate(img_list):
+            im = Image.open(op.join(out_dir, fr["annot"])).convert("RGB").resize((W,H))
+            r,c = i//cols, i%cols
+            canvas.paste(im, (c*W, r*H))
+        canvas.save(op.join(out_dir,"storyboard_annot.png"))
+    paste_grid(story, cols=4)
+
+    # small plots
+    inst_pf = df[df["image"].isin([s["image"] for s in story])].groupby("image").size().reindex([s["image"] for s in story]).fillna(0)
+    plt.figure(figsize=(7,2.8)); plt.plot(range(len(inst_pf)), inst_pf.values)
+    plt.title("Instances per Chosen Frame"); plt.xlabel("view idx"); plt.ylabel("#instances")
+    plt.tight_layout(); plt.savefig(op.join(out_dir,"instances_per_chosen.png"), dpi=200); plt.close()
+
+    cov_vals = [s["coverage"] for s in story]
+    plt.figure(figsize=(7,2.8)); plt.plot(range(len(cov_vals)), cov_vals)
+    plt.title("Coverage of Chosen Frames"); plt.xlabel("view idx"); plt.ylabel("coverage")
+    plt.tight_layout(); plt.savefig(op.join(out_dir,"coverage_chosen.png"), dpi=200); plt.close()
+
+    print(f"[OK] story   -> {op.join(out_dir,'story.json')}")
+    print(f"[OK] md      -> {op.join(out_dir,'story.md')}")
+    print(f"[OK] prompts -> {prm_dir}")
+    print(f"[OK] ann     -> {ann_dir}")
+    print(f"[OK] board   -> {op.join(out_dir,'storyboard_annot.png')}")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--frames",     required=True, help="Frames directory")
+    ap.add_argument("--masks_csv",  required=True, help="CSV with columns image,mask[,conf]")
+    ap.add_argument("--mask_root",  default="",    help="Root dir of mask PNGs")
+    ap.add_argument("--semantics",  default="",    help="Optional: mask->label CSV/JSON")
+    ap.add_argument("--poses",      default="",    help="Optional: poses JSON (T_wc 4x4 per image)")
+    ap.add_argument("--selected",   default="",    help="Optional: manual views list (one image name per line)")
+    ap.add_argument("--topn",       type=int, default=12, help="Fallback Top-N by coverage if no --selected")
+    ap.add_argument("--conf_thres", type=float, default=None, help="Mask confidence threshold")
+    ap.add_argument("--out_dir",    required=True, help="Output directory")
+
+    # 3D options
+    ap.add_argument("--enable_3d",  action="store_true", help="Enable 3D annotation if enough info is provided")
+    ap.add_argument("--intrinsics_json", default="", help='JSON with {"fx","fy","cx","cy"}')
+    ap.add_argument("--fx", type=float, default=None); ap.add_argument("--fy", type=float, default=None)
+    ap.add_argument("--cx", type=float, default=None); ap.add_argument("--cy", type=float, default=None)
+    ap.add_argument("--fov_deg", type=float, default=None, help="If no intrinsics, estimate fx=fy from FOV and image width")
+    ap.add_argument("--depth_dir",  default="", help="Optional: directory containing per-frame depth maps")
+    ap.add_argument("--depth_scale",type=float, default=1.0, help="Multiply raw depth by this to get meters (e.g., 0.001 for 16-bit mm)")
+    ap.add_argument("--depth_max",  type=float, default=None, help="If depth is 8-bit normalized, give the max depth in meters")
+    ap.add_argument("--floor_axis", default=None, help='Alternative to depth: intersect viewing ray with floor plane; choose one of {"x","y","z"}')
+    ap.add_argument("--floor_offset", type=float, default=0.0, help="Plane offset d0 in n·X + d0 = 0 (e.g., z=0 -> axis=z, offset=0)")
+
+    ap.add_argument("--max_objs_each", type=int, default=200, help="Max instances to scan per image before filtering")
+    ap.add_argument("--max_objs_total",type=int, default=20,  help="Max objects drawn/summarized per image")
+
+    args = ap.parse_args()
+    main(args)

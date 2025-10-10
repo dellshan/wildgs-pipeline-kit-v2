@@ -1,0 +1,21 @@
+path: datasets/indoor_obstacle
+train: images/train
+val: images/val
+test: images/test
+nc: 15
+names:
+- person
+- bicycle
+- bus
+- truck
+- car
+- motorbike
+- reflective_cone
+- trash_can
+- warning_column
+- spherical_barrier
+- pole
+- dog
+- tricycle
+- fire_hydrant
+- misc

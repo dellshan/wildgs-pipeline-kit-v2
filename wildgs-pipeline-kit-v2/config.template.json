@@ -1,0 +1,9 @@
+{
+  "frames_dir": "/PATH/TO/frames_dir",
+  "instances_csv": "data/instances_B_conf08.csv",
+  "mask_root": "/PATH/TO/mask_root (optional)",
+  "out_dir": "figs",
+  "tables_dir": "tables",
+  "topk_list": [10, 20, 50, 100],
+  "storyboard_topn": 12
+}

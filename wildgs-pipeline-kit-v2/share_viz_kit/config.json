@@ -1,0 +1,14 @@
+{
+  "frames_dir": "/data/yshan/wildgs-pipeline-kit-v2/output/gs_export_viewB/renders",
+  "instances_csv": "data/instances_B_conf095.csv",
+  "mask_root": "/data/yshan/wildgs-pipeline-kit-v2/output/instances_B_masks_conf08",
+  "out_dir": "figs",
+  "tables_dir": "tables",
+  "topk_list": [
+    10,
+    20,
+    50,
+    100
+  ],
+  "storyboard_topn": 12
+}
