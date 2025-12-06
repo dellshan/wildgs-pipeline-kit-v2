@@ -1,22 +1,28 @@
-# Share Viz Kit
+Advanced WildGS‑SLAM → CLIP → SVD Pipeline (v2)
+Advanced WildGS‑SLAM → CLIP → SVD Pipeline (v2)
+This repository contains an end‑to‑end PyTorch implementation that:
 
-生成论文可视化与表格的最小包（仅数据衍生可视化，不含私有推理代码）。默认使用**你当前的 Python/conda 环境**。
+Runs WildGS‑SLAM (monocular 3D Gaussian SLAM with RAFT optical flow),
+Performs multi‑view scene understanding with CLIP,
+Generates short videos with Stable‑Video‑Diffusion.
+Structure
+wildgs_pipeline/
+├── wildgs/
+│   ├── __init__.py
+│   └── pipeline.py   # main implementation
+├── requirements.txt  # pip install -r requirements.txt
+└── README.md         # this file
+Quick start
+# clone or unzip, then:
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 
-## 运行
-```bash
-# 直接跑（不改环境）
-bash run_all.sh
-
-# 如需在当前环境安装依赖
-INSTALL=1 bash run_all.sh
-配置
-
-config.json 的字段：
-
-frames_dir: 原始帧目录
-
-instances_csv: CSV（列包含 image,mask,conf；mask 仅文件名）
-
-mask_root: 掩码根目录（可选；用于 coverage 和故事板）
-
-以及输出与评估参数
+# run the demo (will create ./out/ with results)
+python - <<'PY'
+from wildgs import WildGSCLIPSVDPipeline, Path
+pipe = WildGSCLIPSVDPipeline()
+out_dir = Path('./out')
+out_dir.mkdir(exist_ok=True)
+pipe.process_video('your_video.mp4', out_dir)
+PY
+If you have no video at hand, the script will automatically create a 3‑second dummy clip and process it.
